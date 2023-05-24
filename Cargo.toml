@@ -15,7 +15,7 @@ categories = ["api-bindings", "asynchronous"]
 async-trait = "0.1"
 futures = "0.3"
 log = "0.4"
-roux = "2"
+roux = { git = "https://github.com/UnknownDevices/roux" }
 tokio = "1"
 tokio-retry = "0.3"
 
