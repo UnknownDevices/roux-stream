@@ -44,9 +44,9 @@ use futures::Stream;
 use futures::{Sink, SinkExt};
 use log::{debug, warn};
 use roux::{
+    comment::CommentData,
     response::{BasicThing, Listing},
     submission::SubmissionData,
-    comment::CommentData,
     util::RouxError,
     Subreddit,
 };
@@ -90,9 +90,7 @@ const LIMIT: u32 = 100;
 
 #[async_trait]
 impl Puller<SubmissionData, RouxError> for SubredditPuller {
-    async fn pull(
-        &mut self,
-    ) -> Result<BasicThing<Listing<BasicThing<SubmissionData>>>, RouxError> {
+    async fn pull(&mut self) -> Result<BasicThing<Listing<BasicThing<SubmissionData>>>, RouxError> {
         self.subreddit.latest(LIMIT, None).await
     }
 
@@ -111,9 +109,7 @@ impl Puller<SubmissionData, RouxError> for SubredditPuller {
 
 #[async_trait]
 impl Puller<CommentData, RouxError> for SubredditPuller {
-    async fn pull(
-        &mut self,
-    ) -> Result<BasicThing<Listing<BasicThing<CommentData>>>, RouxError> {
+    async fn pull(&mut self) -> Result<BasicThing<Listing<BasicThing<CommentData>>>, RouxError> {
         self.subreddit.latest_comments(None, Some(LIMIT)).await
     }
 
@@ -179,7 +175,6 @@ async fn pull_into_sink<S, R, Data, E>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
-    mut ids_to_ignore: HashSet<String>,
     mut sink: S,
 ) -> Result<(), S::Error>
 where
@@ -196,71 +191,26 @@ where
      */
     let puller_mutex = Mutex::new(puller);
 
-    loop {
+    let mut seen_ids = loop {
         debug!("Fetching latest {} from {}", items_name, source_name);
-        let latest = RetryIf::spawn(
-            retry_strategy.clone(),
-            || async {
-                let mut puller = puller_mutex.lock().await;
-
-                // TODO: There is probably a nicer way to write those matches
-
-                if let Some(timeout_duration) = timeout {
-                    let timeout_result =
-                        tokio::time::timeout(timeout_duration, puller.pull()).await;
-                    match timeout_result {
-                        Err(timeout_err) => Err::<BasicThing<Listing<BasicThing<Data>>>, _>(
-                            StreamError::TimeoutError(timeout_err),
-                        ),
-                        Ok(timeout_ok) => match timeout_ok {
-                            Err(puller_err) => Err(StreamError::SourceError(puller_err)),
-                            Ok(pull_ok) => Ok(pull_ok),
-                        },
-                    }
-                } else {
-                    match puller.pull().await {
-                        Err(puller_err) => Err(StreamError::SourceError(puller_err)),
-                        Ok(pull_ok) => Ok(pull_ok),
-                    }
-                }
-            },
-            |error: &StreamError<E>| {
-                debug!(
-                    "Error while fetching the latest {} from {}: {}",
-                    items_name, source_name, error,
-                );
-                true
-            },
+        let latest = pull(
+            &retry_strategy,
+            &puller_mutex,
+            timeout,
+            &items_name,
+            &source_name,
         )
         .await;
+
         match latest {
             Ok(latest_items) => {
-                let latest_items = latest_items.data.children.into_iter().map(|item| item.data);
-                let mut latest_ids: HashSet<String> = HashSet::new();
-
-                let mut num_new = 0;
                 let puller = puller_mutex.lock().await;
-                for item in latest_items {
-                    let id = puller.get_id(&item);
-                    latest_ids.insert(id.clone());
-                    if !ids_to_ignore.contains(&id) {
-                        num_new += 1;
-                        sink.send(Ok(item)).await?;
-                    }
-                }
-
-                debug!(
-                    "Got {} new {} for {} (out of {})",
-                    num_new, items_name, source_name, LIMIT
-                );
-                if num_new == latest_ids.len() && !ids_to_ignore.is_empty() {
-                    warn!(
-                        "All received {} for {} were new, try a shorter sleep_time",
-                        items_name, source_name
-                    );
-                }
-
-                ids_to_ignore = latest_ids;
+                break latest_items
+                    .data
+                    .children
+                    .into_iter()
+                    .map(|item| puller.get_id(&item.data))
+                    .collect::<HashSet<_>>();
             }
             Err(error) => {
                 // Forward the error through the stream
@@ -273,7 +223,112 @@ where
         }
 
         sleep(sleep_time).await;
+    };
+
+    debug!("IDs of old {} from {} aquired", items_name, source_name);
+
+    loop {
+        debug!("Fetching latest {} from {}", items_name, source_name);
+        let latest = pull(
+            &retry_strategy,
+            &puller_mutex,
+            timeout,
+            &items_name,
+            &source_name,
+        )
+        .await;
+
+        match latest {
+            Ok(latest_items) => {
+                let latest_items = latest_items.data.children.into_iter().map(|item| item.data);
+                let mut latest_ids: HashSet<String> = HashSet::new();
+
+                let mut num_new = 0;
+                let puller = puller_mutex.lock().await;
+                for item in latest_items {
+                    let id = puller.get_id(&item);
+                    latest_ids.insert(id.clone());
+                    if !seen_ids.contains(&id) {
+                        seen_ids.insert(id);
+                        num_new += 1;
+                        sink.send(Ok(item)).await?;
+                    }
+                }
+
+                debug!(
+                    "Got {} new {} for {} (out of {})",
+                    num_new, items_name, source_name, LIMIT
+                );
+                if num_new == latest_ids.len() && !seen_ids.is_empty() {
+                    warn!(
+                        "All received {} for {} were new, try a shorter sleep_time",
+                        items_name, source_name
+                    );
+                }
+
+                seen_ids = latest_ids;
+            }
+            Err(error) => {
+                // Forward the error through the stream
+                warn!(
+                    "Error while fetching the latest {} from {}: {}",
+                    items_name, source_name, error,
+                );
+                sink.send(Err(error)).await?;
+            }
+        }
+
+        // TODO: use sleep until, send warning if loop doesn complete in sleep time, rename sleep_time to interval
+        sleep(sleep_time).await;
     }
+}
+
+async fn pull<R, Data, E>(
+    retry_strategy: &R,
+    puller_mutex: &Mutex<&mut (dyn Puller<Data, E> + Send + Sync)>,
+    timeout: Option<Duration>,
+    items_name: &String,
+    source_name: &String,
+) -> Result<BasicThing<Listing<BasicThing<Data>>>, StreamError<E>>
+where
+    R: IntoIterator<Item = Duration> + Clone,
+    E: Error,
+{
+    let latest = RetryIf::spawn(
+        retry_strategy.clone(),
+        || async {
+            let mut puller = puller_mutex.lock().await;
+
+            // TODO: There is probably a nicer way to write those matches
+
+            if let Some(timeout_duration) = timeout {
+                let timeout_result = tokio::time::timeout(timeout_duration, puller.pull()).await;
+                match timeout_result {
+                    Err(timeout_err) => Err::<BasicThing<Listing<BasicThing<Data>>>, _>(
+                        StreamError::TimeoutError(timeout_err),
+                    ),
+                    Ok(timeout_ok) => match timeout_ok {
+                        Err(puller_err) => Err(StreamError::SourceError(puller_err)),
+                        Ok(pull_ok) => Ok(pull_ok),
+                    },
+                }
+            } else {
+                match puller.pull().await {
+                    Err(puller_err) => Err(StreamError::SourceError(puller_err)),
+                    Ok(pull_ok) => Ok(pull_ok),
+                }
+            }
+        },
+        |error: &StreamError<E>| {
+            debug!(
+                "Error while fetching the latest {} from {}: {}",
+                items_name, source_name, error,
+            );
+            true
+        },
+    )
+    .await;
+    latest
 }
 
 /**
@@ -286,7 +341,6 @@ fn stream_items<R, I, T>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
-    ids_to_ignore: HashSet<String>,
 ) -> (
     impl Stream<Item = Result<T, StreamError<RouxError>>>,
     JoinHandle<Result<(), mpsc::SendError>>,
@@ -308,7 +362,6 @@ where
             sleep_time,
             retry_strategy,
             timeout,
-            ids_to_ignore,
             sink,
         )
         .await
@@ -410,7 +463,6 @@ pub fn stream_submissions<R, I>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
-    ids_to_ignore: HashSet<String>,
 ) -> (
     impl Stream<Item = Result<SubmissionData, StreamError<RouxError>>>,
     JoinHandle<Result<(), mpsc::SendError>>,
@@ -419,7 +471,7 @@ where
     R: IntoIterator<IntoIter = I, Item = Duration> + Clone + Send + Sync + 'static,
     I: Iterator<Item = Duration> + Send + Sync + 'static,
 {
-    stream_items(subreddit, sleep_time, retry_strategy, timeout, ids_to_ignore)
+    stream_items(subreddit, sleep_time, retry_strategy, timeout)
 }
 
 /**
@@ -522,7 +574,6 @@ pub fn stream_comments<R, I>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
-    ids_to_ignore: HashSet<String>,
 ) -> (
     impl Stream<Item = Result<CommentData, StreamError<RouxError>>>,
     JoinHandle<Result<(), mpsc::SendError>>,
@@ -531,7 +582,7 @@ where
     R: IntoIterator<IntoIter = I, Item = Duration> + Clone + Send + Sync + 'static,
     I: Iterator<Item = Duration> + Send + Sync + 'static,
 {
-    stream_items(subreddit, sleep_time, retry_strategy, timeout, ids_to_ignore)
+    stream_items(subreddit, sleep_time, retry_strategy, timeout)
 }
 
 #[cfg(test)]
@@ -661,7 +712,6 @@ mod tests {
                 Duration::from_millis(1),
                 retry_strategy,
                 timeout,
-                Default::default(),
                 sink,
             )
             .await
@@ -780,7 +830,6 @@ mod tests {
                 Duration::from_millis(1),
                 vec![],
                 None,
-                Default::default(),
                 sink,
             )
             .await
@@ -801,7 +850,6 @@ mod tests {
                 Duration::from_millis(1),
                 vec![],
                 None,
-                Default::default(),
                 sink,
             )
             .await

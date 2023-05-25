@@ -28,12 +28,7 @@ comments at the same time. You can run it using
  */
 
 use futures::{Stream, StreamExt};
-use roux::{
-    submission::SubmissionData,
-    comment::CommentData,
-    util::RouxError,
-    Subreddit,
-};
+use roux::{comment::CommentData, submission::SubmissionData, util::RouxError, Subreddit};
 use tokio::time::Duration;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 
@@ -92,14 +87,12 @@ async fn main() {
         Duration::from_secs(60),
         retry_strategy.clone(),
         Some(timeout.clone()),
-        Default::default()
     );
     let (mut comments_stream, comments_handle) = roux_stream::stream_comments(
         &subreddit,
         Duration::from_secs(10),
         retry_strategy.clone(),
         Some(timeout.clone()),
-        Default::default()
     );
 
     let (submission_result, comment_result) = tokio::join!(
