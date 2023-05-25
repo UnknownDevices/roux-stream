@@ -179,6 +179,7 @@ async fn pull_into_sink<S, R, Data, E>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
+    mut ids_to_ignore: HashSet<String>,
     mut sink: S,
 ) -> Result<(), S::Error>
 where
@@ -188,7 +189,6 @@ where
 {
     let items_name = puller.get_items_name();
     let source_name = puller.get_source_name();
-    let mut seen_ids: HashSet<String> = HashSet::new();
 
     /*
     Because `puller.pull` takes a mutable reference we need wrap it in
@@ -243,7 +243,7 @@ where
                 for item in latest_items {
                     let id = puller.get_id(&item);
                     latest_ids.insert(id.clone());
-                    if !seen_ids.contains(&id) {
+                    if !ids_to_ignore.contains(&id) {
                         num_new += 1;
                         sink.send(Ok(item)).await?;
                     }
@@ -253,14 +253,14 @@ where
                     "Got {} new {} for {} (out of {})",
                     num_new, items_name, source_name, LIMIT
                 );
-                if num_new == latest_ids.len() && !seen_ids.is_empty() {
+                if num_new == latest_ids.len() && !ids_to_ignore.is_empty() {
                     warn!(
                         "All received {} for {} were new, try a shorter sleep_time",
                         items_name, source_name
                     );
                 }
 
-                seen_ids = latest_ids;
+                ids_to_ignore = latest_ids;
             }
             Err(error) => {
                 // Forward the error through the stream
@@ -286,6 +286,7 @@ fn stream_items<R, I, T>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
+    ids_to_ignore: HashSet<String>,
 ) -> (
     impl Stream<Item = Result<T, StreamError<RouxError>>>,
     JoinHandle<Result<(), mpsc::SendError>>,
@@ -307,6 +308,7 @@ where
             sleep_time,
             retry_strategy,
             timeout,
+            ids_to_ignore,
             sink,
         )
         .await
@@ -408,6 +410,7 @@ pub fn stream_submissions<R, I>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
+    ids_to_ignore: HashSet<String>,
 ) -> (
     impl Stream<Item = Result<SubmissionData, StreamError<RouxError>>>,
     JoinHandle<Result<(), mpsc::SendError>>,
@@ -416,7 +419,7 @@ where
     R: IntoIterator<IntoIter = I, Item = Duration> + Clone + Send + Sync + 'static,
     I: Iterator<Item = Duration> + Send + Sync + 'static,
 {
-    stream_items(subreddit, sleep_time, retry_strategy, timeout)
+    stream_items(subreddit, sleep_time, retry_strategy, timeout, ids_to_ignore)
 }
 
 /**
@@ -519,6 +522,7 @@ pub fn stream_comments<R, I>(
     sleep_time: Duration,
     retry_strategy: R,
     timeout: Option<Duration>,
+    ids_to_ignore: HashSet<String>,
 ) -> (
     impl Stream<Item = Result<CommentData, StreamError<RouxError>>>,
     JoinHandle<Result<(), mpsc::SendError>>,
@@ -527,7 +531,7 @@ where
     R: IntoIterator<IntoIter = I, Item = Duration> + Clone + Send + Sync + 'static,
     I: Iterator<Item = Duration> + Send + Sync + 'static,
 {
-    stream_items(subreddit, sleep_time, retry_strategy, timeout)
+    stream_items(subreddit, sleep_time, retry_strategy, timeout, ids_to_ignore)
 }
 
 #[cfg(test)]
@@ -657,6 +661,7 @@ mod tests {
                 Duration::from_millis(1),
                 retry_strategy,
                 timeout,
+                Default::default(),
                 sink,
             )
             .await
@@ -775,6 +780,7 @@ mod tests {
                 Duration::from_millis(1),
                 vec![],
                 None,
+                Default::default(),
                 sink,
             )
             .await
@@ -795,6 +801,7 @@ mod tests {
                 Duration::from_millis(1),
                 vec![],
                 None,
+                Default::default(),
                 sink,
             )
             .await

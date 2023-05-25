@@ -92,12 +92,14 @@ async fn main() {
         Duration::from_secs(60),
         retry_strategy.clone(),
         Some(timeout.clone()),
+        Default::default()
     );
     let (mut comments_stream, comments_handle) = roux_stream::stream_comments(
         &subreddit,
         Duration::from_secs(10),
         retry_strategy.clone(),
         Some(timeout.clone()),
+        Default::default()
     );
 
     let (submission_result, comment_result) = tokio::join!(
