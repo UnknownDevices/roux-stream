@@ -54,7 +54,7 @@ use std::error::Error;
 use std::fmt::Display;
 use std::marker::Unpin;
 use std::{collections::HashSet, time::Duration};
-use tokio::sync::Mutex;
+
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 use tokio::time::sleep;
@@ -70,12 +70,7 @@ we can provide a mock implementation.
 */
 #[async_trait]
 trait Puller<Data, E: Error> {
-    // The "real" implementations of this function (for pulling
-    // submissions and comments from Reddit) would not need `self` to
-    // be `mut` here (because there the state change happens externally,
-    // i.e. within Reddit). However, writing good tests is much easier
-    // if `self` is mutable here.
-    async fn pull(&mut self) -> Result<BasicThing<Listing<BasicThing<Data>>>, E>;
+    async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<Data>>>, E>;
     fn get_id(&self, data: &Data) -> String;
     fn get_items_name(&self) -> String;
     fn get_source_name(&self) -> String;
@@ -90,7 +85,7 @@ const LIMIT: u32 = 100;
 
 #[async_trait]
 impl Puller<SubmissionData, RouxError> for SubredditPuller {
-    async fn pull(&mut self) -> Result<BasicThing<Listing<BasicThing<SubmissionData>>>, RouxError> {
+    async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<SubmissionData>>>, RouxError> {
         self.subreddit.latest(LIMIT, None).await
     }
 
@@ -109,7 +104,7 @@ impl Puller<SubmissionData, RouxError> for SubredditPuller {
 
 #[async_trait]
 impl Puller<CommentData, RouxError> for SubredditPuller {
-    async fn pull(&mut self) -> Result<BasicThing<Listing<BasicThing<CommentData>>>, RouxError> {
+    async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<CommentData>>>, RouxError> {
         self.subreddit.latest_comments(None, Some(LIMIT)).await
     }
 
@@ -189,22 +184,14 @@ where
     Because `puller.pull` takes a mutable reference we need wrap it in
     a mutex to be able to pass it as a callback to `RetryIf::spawn`.
      */
-    let puller_mutex = Mutex::new(puller);
+    let puller = puller;
 
     let mut seen_ids = loop {
         debug!("Fetching latest {} from {}", items_name, source_name);
-        let latest = pull(
-            &retry_strategy,
-            &puller_mutex,
-            timeout,
-            &items_name,
-            &source_name,
-        )
-        .await;
+        let latest = pull(&retry_strategy, puller, timeout, &items_name, &source_name).await;
 
         match latest {
             Ok(latest_items) => {
-                let puller = puller_mutex.lock().await;
                 break latest_items
                     .data
                     .children
@@ -229,14 +216,7 @@ where
 
     loop {
         debug!("Fetching latest {} from {}", items_name, source_name);
-        let latest = pull(
-            &retry_strategy,
-            &puller_mutex,
-            timeout,
-            &items_name,
-            &source_name,
-        )
-        .await;
+        let latest = pull(&retry_strategy, puller, timeout, &items_name, &source_name).await;
 
         match latest {
             Ok(latest_items) => {
@@ -244,7 +224,6 @@ where
                 let mut latest_ids: HashSet<String> = HashSet::new();
 
                 let mut num_new = 0;
-                let puller = puller_mutex.lock().await;
                 for item in latest_items {
                     let id = puller.get_id(&item);
                     latest_ids.insert(id.clone());
@@ -285,7 +264,7 @@ where
 
 async fn pull<R, Data, E>(
     retry_strategy: &R,
-    puller_mutex: &Mutex<&mut (dyn Puller<Data, E> + Send + Sync)>,
+    puller: &mut (dyn Puller<Data, E> + Send + Sync),
     timeout: Option<Duration>,
     items_name: &String,
     source_name: &String,
@@ -297,10 +276,7 @@ where
     let latest = RetryIf::spawn(
         retry_strategy.clone(),
         || async {
-            let mut puller = puller_mutex.lock().await;
-
             // TODO: There is probably a nicer way to write those matches
-
             if let Some(timeout_duration) = timeout {
                 let timeout_result = tokio::time::timeout(timeout_duration, puller.pull()).await;
                 match timeout_result {
@@ -616,13 +592,13 @@ mod tests {
     impl Error for MockSourceError {}
 
     struct MockPuller {
-        iter: Box<dyn Iterator<Item = Vec<String>> + Sync + Send>,
+        iter: RwLock<<Vec<Vec<String>> as IntoIterator>::IntoIter>,
     }
 
     impl MockPuller {
         fn new(batches: Vec<Vec<&str>>) -> Self {
-            MockPuller {
-                iter: Box::new(
+            Self {
+                iter: RwLock::new(
                     batches
                         .iter()
                         .map(|batch| batch.iter().map(|item| item.to_string()).collect())
@@ -642,11 +618,9 @@ mod tests {
         that begins with "sleep" then the function sleeps for 1s before
         returning.
         */
-        async fn pull(
-            &mut self,
-        ) -> Result<BasicThing<Listing<BasicThing<String>>>, MockSourceError> {
+        async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<String>>>, MockSourceError> {
             let children;
-            if let Some(items) = self.iter.next() {
+            if let Some(items) = self.iter.write().await.next() {
                 match items.as_slice() {
                     [item] if item.starts_with("error") => {
                         return Err(MockSourceError(item.clone()));
