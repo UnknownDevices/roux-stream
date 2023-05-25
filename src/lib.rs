@@ -59,6 +59,7 @@ use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 use tokio::time::sleep;
 use tokio_retry::RetryIf;
+    // How many items to fetch per request
 
 /**
 The [`roux`] APIs for submissions and comments are slightly different. We use
@@ -70,7 +71,7 @@ we can provide a mock implementation.
 */
 #[async_trait]
 trait Puller<Data, E: Error> {
-    async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<Data>>>, E>;
+    async fn pull(&self, limit: u32) -> Result<BasicThing<Listing<BasicThing<Data>>>, E>;
     fn get_id(&self, data: &Data) -> String;
     fn get_items_name(&self) -> String;
     fn get_source_name(&self) -> String;
@@ -80,13 +81,10 @@ struct SubredditPuller {
     subreddit: Subreddit,
 }
 
-// How many items to fetch per request
-const LIMIT: u32 = 100;
-
 #[async_trait]
 impl Puller<SubmissionData, RouxError> for SubredditPuller {
-    async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<SubmissionData>>>, RouxError> {
-        self.subreddit.latest(LIMIT, None).await
+    async fn pull(&self, limit: u32) -> Result<BasicThing<Listing<BasicThing<SubmissionData>>>, RouxError> {
+        self.subreddit.latest(limit, None).await
     }
 
     fn get_id(&self, data: &SubmissionData) -> String {
@@ -104,8 +102,8 @@ impl Puller<SubmissionData, RouxError> for SubredditPuller {
 
 #[async_trait]
 impl Puller<CommentData, RouxError> for SubredditPuller {
-    async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<CommentData>>>, RouxError> {
-        self.subreddit.latest_comments(None, Some(LIMIT)).await
+    async fn pull(&self, limit: u32) -> Result<BasicThing<Listing<BasicThing<CommentData>>>, RouxError> {
+        self.subreddit.latest_comments(None, Some(limit)).await
     }
 
     fn get_id(&self, data: &CommentData) -> String {
@@ -168,6 +166,7 @@ following steps in an endless loop:
 async fn pull_into_sink<S, R, Data, E>(
     puller: &mut (dyn Puller<Data, E> + Send + Sync),
     sleep_time: Duration,
+    limit: u32,
     retry_strategy: R,
     timeout: Option<Duration>,
     mut sink: S,
@@ -188,7 +187,7 @@ where
 
     let mut seen_ids = loop {
         debug!("Fetching latest {} from {}", items_name, source_name);
-        let latest = pull(&retry_strategy, puller, timeout, &items_name, &source_name).await;
+        let latest = pull(limit, &retry_strategy, puller, timeout, &items_name, &source_name).await;
 
         match latest {
             Ok(latest_items) => {
@@ -216,7 +215,7 @@ where
 
     loop {
         debug!("Fetching latest {} from {}", items_name, source_name);
-        let latest = pull(&retry_strategy, puller, timeout, &items_name, &source_name).await;
+        let latest = pull(limit, &retry_strategy, puller, timeout, &items_name, &source_name).await;
 
         match latest {
             Ok(latest_items) => {
@@ -236,7 +235,7 @@ where
 
                 debug!(
                     "Got {} new {} for {} (out of {})",
-                    num_new, items_name, source_name, LIMIT
+                    num_new, items_name, source_name, limit
                 );
                 if num_new == latest_ids.len() && !seen_ids.is_empty() {
                     warn!(
@@ -263,6 +262,7 @@ where
 }
 
 async fn pull<R, Data, E>(
+    limit: u32,
     retry_strategy: &R,
     puller: &mut (dyn Puller<Data, E> + Send + Sync),
     timeout: Option<Duration>,
@@ -278,7 +278,7 @@ where
         || async {
             // TODO: There is probably a nicer way to write those matches
             if let Some(timeout_duration) = timeout {
-                let timeout_result = tokio::time::timeout(timeout_duration, puller.pull()).await;
+                let timeout_result = tokio::time::timeout(timeout_duration, puller.pull(limit)).await;
                 match timeout_result {
                     Err(timeout_err) => Err::<BasicThing<Listing<BasicThing<Data>>>, _>(
                         StreamError::TimeoutError(timeout_err),
@@ -289,7 +289,7 @@ where
                     },
                 }
             } else {
-                match puller.pull().await {
+                match puller.pull(limit).await {
                     Err(puller_err) => Err(StreamError::SourceError(puller_err)),
                     Ok(pull_ok) => Ok(pull_ok),
                 }
@@ -315,6 +315,7 @@ Depending on `T`, this function will either stream submissions or comments.
 fn stream_items<R, I, T>(
     subreddit: &Subreddit,
     sleep_time: Duration,
+    limit: u32,
     retry_strategy: R,
     timeout: Option<Duration>,
 ) -> (
@@ -336,6 +337,7 @@ where
         pull_into_sink(
             &mut SubredditPuller { subreddit },
             sleep_time,
+            limit,
             retry_strategy,
             timeout,
             sink,
@@ -437,6 +439,7 @@ async fn main() {
 pub fn stream_submissions<R, I>(
     subreddit: &Subreddit,
     sleep_time: Duration,
+    limit: u32,
     retry_strategy: R,
     timeout: Option<Duration>,
 ) -> (
@@ -447,7 +450,7 @@ where
     R: IntoIterator<IntoIter = I, Item = Duration> + Clone + Send + Sync + 'static,
     I: Iterator<Item = Duration> + Send + Sync + 'static,
 {
-    stream_items(subreddit, sleep_time, retry_strategy, timeout)
+    stream_items(subreddit, sleep_time, limit, retry_strategy, timeout)
 }
 
 /**
@@ -548,6 +551,7 @@ async fn main() {
 pub fn stream_comments<R, I>(
     subreddit: &Subreddit,
     sleep_time: Duration,
+    limit: u32,
     retry_strategy: R,
     timeout: Option<Duration>,
 ) -> (
@@ -558,7 +562,8 @@ where
     R: IntoIterator<IntoIter = I, Item = Duration> + Clone + Send + Sync + 'static,
     I: Iterator<Item = Duration> + Send + Sync + 'static,
 {
-    stream_items(subreddit, sleep_time, retry_strategy, timeout)
+    // debug_assert!()
+    stream_items(subreddit, sleep_time, limit, retry_strategy, timeout)
 }
 
 #[cfg(test)]
@@ -618,7 +623,7 @@ mod tests {
         that begins with "sleep" then the function sleeps for 1s before
         returning.
         */
-        async fn pull(&self) -> Result<BasicThing<Listing<BasicThing<String>>>, MockSourceError> {
+        async fn pull(&self, _limit: u32) -> Result<BasicThing<Listing<BasicThing<String>>>, MockSourceError> {
             let children;
             if let Some(items) = self.iter.write().await.next() {
                 match items.as_slice() {
@@ -684,6 +689,7 @@ mod tests {
             pull_into_sink(
                 &mut mock_puller,
                 Duration::from_millis(1),
+                100,
                 retry_strategy,
                 timeout,
                 sink,
@@ -802,6 +808,7 @@ mod tests {
             pull_into_sink(
                 &mut mock_puller,
                 Duration::from_millis(1),
+                100,
                 vec![],
                 None,
                 sink,
@@ -822,6 +829,7 @@ mod tests {
             pull_into_sink(
                 &mut mock_puller,
                 Duration::from_millis(1),
+                100,
                 vec![],
                 None,
                 sink,

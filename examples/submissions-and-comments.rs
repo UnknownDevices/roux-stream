@@ -85,12 +85,14 @@ async fn main() {
     let (mut submissions_stream, submissions_handle) = roux_stream::stream_submissions(
         &subreddit,
         Duration::from_secs(60),
+        100,
         retry_strategy.clone(),
         Some(timeout.clone()),
     );
     let (mut comments_stream, comments_handle) = roux_stream::stream_comments(
         &subreddit,
         Duration::from_secs(10),
+        100,
         retry_strategy.clone(),
         Some(timeout.clone()),
     );
